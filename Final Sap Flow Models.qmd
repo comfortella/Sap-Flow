@@ -1,0 +1,457 @@
+---
+title: "Final Sap Flow Models"
+format: pdf
+editor: visual
+---
+
+## Create Data Set
+
+```{r}
+library(zoo)
+library(tidyverse)
+library(naniar)   
+library(skimr)
+library(VIM)  
+library(dplyr)
+library(glmnet)
+library(plotly)
+library(vip)
+library(GGally)
+library(ggplot2)
+library(viridis)
+library(mgcv)
+library(dlm)
+library(knitr)
+library(Metrics)
+library(corrplot)
+
+data_raw <- read.csv("sfmetwp_combined.csv") 
+#remove non necessary variables
+data_cleaner <- data_raw |>select(-sf1762,-sf164E,-sf166c,-sf1659 ,-sf1739,-sf1710,-sf1738,-sf1696,-wpsd, -meanWP,-sf1663,-sf1743 ) |> filter(!is.na(rounddate))
+
+#extract date and time from rounddate to use later
+data_clean_std_whole <-as.data.frame(scale(data_cleaner[,2:10]))
+Date <- data_cleaner$rounddate
+Time <- substr(Date, regexpr("T", Date) + 1, regexpr("T", Date) + 5)
+Date <- substr(Date, 1, regexpr("T", Date) -1)
+
+data_clean_std_whole <- cbind(data_cleaner$rounddate,Date,Time,data_clean_std_whole)
+data_clean_std_whole <-na.omit(data_clean_std_whole)
+
+#create soil water bucket variable
+raw_copy <- na.omit(select(data_raw,rounddate,TotRain,sf172e))
+EvapRate <- 1/24
+DrainRate <-0.3/24 
+SoilWaterBucket <- numeric(length(raw_copy$TotRain))
+
+
+for (i in 1:length(raw_copy$TotRain)){
+  if (i!=1){
+      SoilWaterBucket[i] <- max(SoilWaterBucket[i-1]+raw_copy$TotRain[i]-EvapRate-DrainRate,0)
+    } else {SoilWaterBucket[i] <-  0.05}
+}
+SoilWaterBucket<- scale(SoilWaterBucket)
+
+#put it all into one table
+data_clean_std_whole = cbind(data_clean_std_whole,SoilWaterBucket)
+
+#creates the truncated data set seperately
+data_clean_std_whole_trunc <- data_clean_std_whole |> mutate(sf172e = ifelse((hm(Time)>=hm("7:00")&hm(Time)<=hm("15:00")),sf172e,NA))
+
+#creates just the crucial variables dataset
+data_clean_std_whole_trunc_int = data_clean_std_whole_trunc |> select(sf172e,Tair,VPD,RH,Wspeed,SoilWaterBucket,solarkW)
+Xtrain <- select(data_clean_std_whole_trunc_int,-sf172e)
+Ytrain <- select(data_clean_std_whole_trunc_int,sf172e) 
+
+```
+
+## EDA
+
+```{r}
+#checks how incomplete each variable is and shows summaries 
+skim(data_raw)
+
+#Sap flow exploration
+acf(data_clean_std_whole$sf172e, lag.max = 96, main = "Autocorrelation of Sap Flow") 
+
+#correlation plot
+cor_matrix <- cor(data_clean_std_whole[,4:13], use = "pairwise.complete.obs")
+corrplot(cor_matrix, method = "color", type = "upper",
+         tl.col = "black", tl.srt = 45, addCoef.col = "black")
+  
+
+#---------AVG daily 
+var <- "sf172e"   # change this to any column name you want to plot on average daily pattern
+
+# daily averages with confidence intervals
+Daily_AVG <- data_clean_std_whole %>%
+  group_by(Time) %>%
+  summarise(
+    n = n(),
+    Time.avg = mean(.data[[var]], na.rm = TRUE),
+    sd = sd(.data[[var]], na.rm = TRUE),
+    se = sd / sqrt(n)
+  )
+
+# Confidence intervals
+Daily_AVG <- Daily_AVG %>%
+  mutate(
+    Lower = Time.avg - qt(1 - (0.05 / 2), n - 1) * se,
+    Upper = Time.avg + qt(1 - (0.05 / 2), n - 1) * se
+  )
+
+# unstandardis the data 
+mu <- mean(na.omit(data_raw[[var]]))
+sigma <- sd(na.omit(data_raw[[var]]))
+
+Daily_AVG <- Daily_AVG %>%
+  mutate(
+    x = Time.avg * sigma + mu,
+    Low = Lower * sigma + mu,
+    Up  = Upper * sigma + mu
+  )
+
+# plot
+plot(Daily_AVG$x,
+     type = "l",
+     col = "blue",
+     ylab = paste("Average", var),
+     xlab = "Time of day",
+     xaxt = "n",
+     ylim = range(c(Daily_AVG$x, 0)))
+lines(Daily_AVG$Up, col = "green")
+lines(Daily_AVG$Low, col = "green")
+
+axis(1, at = 1:length(Daily_AVG$Time), labels = Daily_AVG$Time)
+abline(h = 0, col = "red", lty = 2)
+
+
+```
+
+#### Variable Densities
+
+```{r}
+#Total Rainfall density plot
+ggplot(data_cleaner, aes(x = TotRain)) +
+  geom_density(fill = "steelblue", alpha = 0.6) +
+  labs(
+    title = "Density Plot of Total Rainfall",
+    x = "Total Rainfall (mm)",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 14)
+
+#sap flow
+ggplot(data_cleaner, aes(x =sf172e)) +
+  geom_density(fill = "steelblue", alpha = 0.6) +
+  labs(
+    title = "Density Plot of sap flow",
+    x = "Sap Flow (cm³ h⁻¹)",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 14)
+
+# Solar Radiation
+ggplot(data_cleaner, aes(x = solarkW)) +
+  geom_density(fill = "steelblue", alpha = 0.6) +
+  labs(
+    title = "Density of Solar Radiation (solarkW)",
+    x = "Solar Radiation (kW/m²)",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 14)
+
+# Soil Water Bucket
+ggplot(data_clean_std_whole, aes(x = SoilWaterBucket)) +
+  geom_density(fill = "steelblue", alpha = 0.6) +
+  labs(
+    title = "Density of Soil Water Bucket",
+    x = "Soil Water Bucket (standardised)",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 14)
+
+# Vapour Pressure Deficit (VPD)
+ggplot(data_cleaner, aes(x = VPD)) +
+  geom_density(fill = "steelblue", alpha = 0.6) +
+  labs(
+    title = "Density of Vapour Pressure Deficit (VPD)",
+    x = "VPD (kPa)",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 14)
+
+# Air Temperature
+ggplot(data_cleaner, aes(x = Tair)) +
+  geom_density(fill = "steelblue", alpha = 0.6) +
+  labs(
+    title = "Density of Air Temperature (Tair)",
+    x = "Air Temperature (°C)",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 14)
+
+# Wind Speed
+ggplot(data_cleaner, aes(x = Wspeed)) +
+  geom_density(fill = "steelblue", alpha = 0.6) +
+  labs(
+    title = "Density of Wind Speed (Wspeed)",
+    x = "Wind Speed (m/s)",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 14)
+
+#-----pairwise density plots
+vars <- data_cleaner[, c("sf172e", "Tair", "solarkW", "VPD", "Wspeed")]
+
+# Define upper panel with contour density plots
+upper_contour <- function(data, mapping, ...) {
+  ggplot(data = data, mapping = mapping) +
+    stat_density_2d(
+      geom = "density_2d", 
+      aes(color = ..level..), 
+      contour = TRUE
+    ) +
+    scale_color_viridis_c(option = "magma", trans = "log1p") +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      legend.position = "none"
+    )
+}
+
+# Create the pair plot
+ggpairs(
+  vars,
+  upper = list(continuous = upper_contour),
+  lower = NULL,                            
+  diag = NULL                               
+) +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+## Regression
+
+#### Truncated Model with interaction
+
+```{r}
+#fit truncated Model
+trunc_int_regress = lm(sf172e~Tair+SoilWaterBucket+Wspeed+VPD+solarkW+(solarkW+SoilWaterBucket+Tair+VPD)^2, data = data_clean_std_whole_trunc_int,na.action = na.exclude)
+summary(trunc_int_regress)
+#Predict
+Pred_regress_trunc <- predict(trunc_int_regress,newX = Xtrain)
+#Calculate Residuals
+Resid_regress_trunc <- residuals(trunc_int_regress)
+#evaluate Residuals
+acf(na.omit(Pred_regress_trunc), lag.max = 96,main='Auto-Correlation Plot for Truncated Linear Regression Residuals')
+pacf(na.omit(Pred_regress_trunc), lag.max = 96,main='Partial Auto-Correlation Plot for Truncated Linear Regression Residuals')
+
+
+```
+
+#### Non-truncated model with interaction
+
+```{r}
+#fit linear regression model 
+simple_regres_interaction_lim <- lm(sf172e~Tair+SoilWaterBucket+Wspeed+VPD+solarkW+(solarkW+SoilWaterBucket+Tair+VPD)^2, data = data_clean_std_whole)
+
+summary(simple_regres_interaction_lim)
+#predictions and residuals
+Pred_regress_non_trunc <- predict(simple_regres_interaction_lim,newX = Xtrain)
+
+Resid_regress_non_trunc <- residuals(simple_regres_interaction_lim)
+```
+
+## GAM's
+
+#### Model
+
+```{r}
+#fit best model
+inter_SWB_VPD <- gam(sf172e ~ te(SoilWaterBucket, VPD)+ s(solarkW) +s(VPD)+s(SoilWaterBucket) +  s(Wspeed)+s(Tair)+ s(Wdir), data = data_clean_std_whole_trunc)
+
+gam.check(inter_SWB_VPD)
+#Adding in all the columns needed for prediction
+Xtrain = cbind(Xtrain,data_clean_std_whole$Wdir)
+names(Xtrain)[7] <- "Wdir" 
+#getting predictions and residuals
+pred_gam<- predict(inter_SWB_VPD, newdata = Xtrain)
+resid_gam <- pred_gam-data_clean_std_whole$sf172e
+```
+
+#### Interaction plots (using truncated data)
+
+```{r}
+#Soil Water bucket and VPD
+inter_SM_VPD <-  gam(sf172e ~ te(SoilWaterBucket, VPD)+ s(solarkW) +s(VPD)+s(SoilWaterBucket) + s(Wspeed)+ s(Tair),
+    data = data_clean_std_whole_trunc)
+
+vis.gam(inter_SM_VPD, view = c("SoilWaterBucket", "VPD"), plot.type = "contour", color = "topo")
+
+#Soil Water bucket and Solar
+inter_SN_solarkW <-  gam(sf172e ~ te(SoilWaterBucket, solarkW)+ s(solarkW) +s(VPD)+s(SoilWaterBucket) +  s(Wspeed)+ s(Tair),
+    data = data_clean_std_whole_trunc)
+
+vis.gam(inter_SN_solarkW, view = c("SoilWaterBucket", "solarkW"), plot.type = "contour", color = "topo")
+
+#Soil Water bucket and VPD
+
+inter_Solar_VPD <-  gam(sf172e ~ te(solarkW, VPD)+ s(solarkW) +s(VPD)+s(SoilWaterBucket) +  s(Wspeed)+ s(Tair),
+    data = data_clean_std_whole_trunc)
+
+vis.gam(inter_Solar_VPD, view = c("solarkW", "VPD"), plot.type = "contour", color = "topo")
+```
+
+## State Space Model
+
+```{r}
+#manually add all the necessary interaction terms
+Ytrain <- as.numeric(data_clean_std_whole$sf172e)
+Xtrain$sun_water <- Xtrain$solarkW * Xtrain$SoilWaterBucket
+Xtrain$sun_VPD <- Xtrain$solarkW * Xtrain$VPD
+Xtrain$sun_AirT <- Xtrain$solarkW * Xtrain$Tair
+Xtrain$VPD_SoilWaterBucket   <- Xtrain$VPD * Xtrain$SoilWaterBucket
+Xtrain$VPD_Tair        <- Xtrain$VPD * Xtrain$Tair
+Xtrain$SoilWaterBucket_Tair  <- Xtrain$SoilWaterBucket * Xtrain$Tair
+Xtrain$sun_wind <- Xtrain$Wspeed*Xtrain$solarkW
+Xtrain$Tair_wind <- Xtrain$Tair*Xtrain$Wspeed
+Xtrain$VPD_wind <- Xtrain$VPD*Xtrain$Wspeed
+Xtrain$SoilwaterBucket_wind <- Xtrain$SoilWaterBucket*Xtrain$Wspeed
+
+Predictors_mat <- as.matrix(select(Xtrain, -RH))
+k <- ncol(Predictors_mat) #number of states - 1
+
+#set up the structure 
+
+buildSSM <- function(par) {
+  dV <- exp(par[1])  # observation noise
+  dW <-  rep(1e-4, k + 1)  # state noise that has been hyper tuned
+  dlmModReg(Predictors_mat, dV = dV, dW = dW)  
+}
+
+#use MLE to find best param
+fit <- dlmMLE(Ytrain, parm = var(Ytrain), build = buildSSM)
+
+
+# fit model using best param
+fitted_model <- buildSSM(fit$par)
+
+#fit filtered pred
+kalman_filtered <- dlmFilter(Ytrain, fitted_model)
+
+#fit smooth predictions looks forward and back
+kalman_smoothed <- dlmSmooth(kalman_filtered)
+
+#one step ahead predictions
+state_pred_smoothed <- kalman_filtered$f
+
+# Replace values more than 6 SD away from mean with NA
+mu <- mean(state_pred_smoothed, na.rm = TRUE)
+sigma <- sd(state_pred_smoothed, na.rm = TRUE)
+pred_State_clean <- ifelse(abs(state_pred_smoothed - mu) > 6 * sigma, NA, state_pred_smoothed)
+#residuals
+resid_state <- pred_State_clean-data_clean_std_whole$sf172e
+
+#plots the beta desired (in this case VPD)
+plot(as_datetime(data_clean_std_whole$`data_cleaner$rounddate`),kalman_smoothed$s[2:8358,3], type = 'l', ylab = "VPD Beta Value",xlab = 'Time', main = 'VPD Beta Over Time',ylim = c(-0.5,2.5))
+
+#residual analysis
+acf(na.omit(resid_state), lag.max = 96,main='ACF Plot for Non-Truncated State Space Residuals')
+pacf(na.omit(resid_state), lag.max = 96,main='PACF Plot for Non-Truncated State Space Residuals')
+```
+
+## Compare Models
+
+```{r}
+actual <- data_clean_std_whole$sf172e
+
+
+#function to generate table of metrics to compare
+evaluate_model <- function(actual, predicted, model_name = "Model", model_obj = NULL) {
+  # remove NAs
+  valid <- complete.cases(actual, predicted)
+  actual <- actual[valid]
+  predicted <- predicted[valid]
+  
+  # core metrics
+  mae   <- mae(actual, predicted)
+  rmse  <- rmse(actual, predicted)
+  mape  <- mean(abs((actual - predicted) / actual)) * 100
+  r2    <- cor(actual, predicted)^2
+  spearman <- cor(actual, predicted, method = "spearman")
+  
+  #some models require different methods for calculating AIC
+   aic_val <- NA
+  if (inherits(model_obj, "dlm")) {
+      ll <- -dlmLL(actual, model_obj)  
+      k <- length(unlist(model_obj$parm))  
+      aic_val <- 2 * k - 2 * ll
+  }else {
+      aic_val <- AIC(model_obj)} 
+  
+  
+  tibble(
+    Model = model_name,
+    MAE = mae,
+    RMSE = rmse,
+    MAPE = mape,
+    R2 = r2,
+    Spearman = spearman,
+    AIC = aic_val
+  )
+}
+
+#puts all the columns together
+results <- bind_rows(
+  evaluate_model(actual, Pred_regress_non_trunc, "Linear Regression (Non-Truncated)", model_obj = simple_regres_interaction_lim),
+  evaluate_model(actual, pred_gam, "GAM", model_obj = inter_SWB_VPD),
+  evaluate_model(actual, pred_State_clean, "State Space Model", model_obj = fitted_model)
+)
+
+kable(results, digits = 3, caption = "Model Performance Comparison (with AIC)")
+
+```
+
+## Final Plot
+
+```{r}
+new_df <- cbind(data_clean_std_whole_trunc,Pred_regress_trunc,Resid_regress_trunc,Pred_regress_non_trunc,Resid_regress_non_trunc,data_clean_std_whole$sf172e, resid_state,pred_gam,pred_State_clean,pred_gam,resid_gam)
+colnames(new_df)[1] <- c("rounddate")
+fig <- plot_ly(new_df, x = ~rounddate)
+
+fig <- fig %>%
+  add_lines(y = ~new_df$sf172e, name = "Sap Flow truncated", yaxis = "y1", line = list(color = 'violet')) %>%
+  add_lines(y = ~new_df$`data_clean_std_whole$sf172e`, name = "Full Sap Flow", yaxis = "y1", line = list(color = 'blue'))%>%
+  add_lines(y = ~new_df$Tair, name = "Air Temp", yaxis = "y1", line = list(color = 'red')) %>%
+  add_lines(y = ~new_df$RH, name = "Relative Humidity", yaxis = "y1", line = list(color = 'green')) %>%
+  add_lines(y = ~new_df$VPD, name = "Vapour Pressure decifit", yaxis = "y1", line = list(color = 'purple')) %>%
+  add_lines(y = ~new_df$SM, name = "Soil Moisture", yaxis = "y1", line = list(color = 'pink')) %>%
+  add_lines(y = ~new_df$Wspeed, name = "Wind Speed", yaxis = "y1", line = list(color = 'navy'))%>%
+  add_lines(y = ~new_df$Wdir, name = "Wind Direction", yaxis = "y1", line = list(color = 'grey'))%>%
+  add_lines(y = ~new_df$TotRain, name = "Total Rainfall", yaxis = "y1", line = list(color = 'black'))%>%
+ add_lines(y = ~new_df$solarkW, name = "Solar radiation", yaxis = "y1", line = list(color = 'darkred'))%>%
+add_lines(y = ~new_df$SoilWaterBucket, name = "SoilWaterBucket", yaxis = "y1", line = list(color = 'salmon'))%>%
+ add_lines(y = ~new_df$Pred_regress_trunc, name = "Predictions Regression Truncated", yaxis = "y1", line = list(color = 'pink'))%>%
+add_lines(y = ~new_df$Resid_regress_trunc, name = "Residuals Regression Truncated", yaxis = "y1", line = list(color = 'navy'))%>%
+add_lines(y = ~new_df$Pred_regress_non_trunc, name = "Predictions Regression Non-Truncated", yaxis = "y1", line = list(color = 'yellow'))%>%
+add_lines(y = ~new_df$Resid_regress_non_trunc, name = "Residuals Regression Non-Truncated", yaxis = "y1", line = list(color = 'cyan'))%>%  
+add_lines(y = ~new_df$pred_gam, name = "Predictions Gam Trunc", yaxis = "y1", line = list(color = 'orange'))%>%
+add_lines(y = ~new_df$resid_gam, name = "Residuals Gam Truncacted", yaxis = "y1", line = list(color = 'tan'))%>%
+add_lines(y = ~new_df$pred_State_clean, name = "State Space Predictions", yaxis = "y1", line = list(color = 'red'))%>%
+add_lines(y = ~new_df$resid_state, name = "State Space Residuals", yaxis = "y1", line = list(color = 'black'))
+
+
+fig <- fig %>%
+  layout(
+    title = "Multiple Time Series with Scroll",
+    xaxis = list(title = "Time",
+      rangeslider = list(type = "date")  # Slider for scrolling
+      
+    ),
+    yaxis = list(title = "Standard deviations", side = "left"),
+    legend = list(x = 0.1, y = 0.9)
+  )
+
+#final interactive plot with everything in
+fig 
+```
